@@ -35,11 +35,12 @@ from typing import Optional
 import requests
 
 # ─── Constants ────────────────────────────────────────────────────────────────
-MOCLAW_AUTH_URL = "https://moclaw.ai/auth"
-MAILGW_BASE     = "https://api.mail.gw"
-POLL_INTERVAL   = 5     # seconds between inbox polls
-POLL_TIMEOUT    = 90    # max seconds to wait for OTP email
-DEFAULT_WORKERS = 2     # default parallel workers for bulk mode
+MOCLAW_AUTH_URL     = "https://moclaw.ai/auth"
+MOCLAW_PRICING_URL  = "https://moclaw.ai/pricing"
+MAILGW_BASE         = "https://api.mail.gw"
+POLL_INTERVAL       = 5     # seconds between inbox polls
+POLL_TIMEOUT        = 90    # max seconds to wait for OTP email
+DEFAULT_WORKERS     = 2     # default parallel workers for bulk mode
 
 # ─── Thread-safe print lock ───────────────────────────────────────────────────
 _print_lock = threading.Lock()
@@ -230,22 +231,67 @@ def register_one(session_name: str, headed: bool = False, prefix: str = "") -> d
 
     title = _run_browser("title", session_name=session_name, headed=headed)
 
+    # ── Activate trial ──
+    trial_activated = False
+    if "/chat" in final_url or "/dashboard" in final_url:
+        trial_activated = activate_trial(session_name=session_name, headed=headed, prefix=prefix)
+
     # Close browser for this session (bulk mode reuses no browser)
     _run_browser("close", session_name=session_name, headed=headed)
     _clean_profile(session_name)
 
     return {
-        "email":           email,
-        "mailgw_password": creds["password"],
-        "mailgw_token":    token,
-        "moclaw_url":      final_url,
-        "page_title":      title,
-        "registered_at":   datetime.now(timezone.utc).isoformat(),
-        "success":         "/chat" in final_url,
+        "email":             email,
+        "mailgw_password":   creds["password"],
+        "mailgw_token":      token,
+        "moclaw_url":        final_url,
+        "page_title":        title,
+        "registered_at":     datetime.now(timezone.utc).isoformat(),
+        "success":           "/chat" in final_url,
+        "trial_activated":   trial_activated,
     }
 
 
-# ─── Step 4: View Inbox ───────────────────────────────────────────────────────
+# ─── Step 4: Activate Trial ───────────────────────────────────────────────────
+
+def activate_trial(session_name: str, headed: bool = False, prefix: str = "") -> bool:
+    """Navigate to /pricing and click 'Start free trial'. Returns True on success."""
+    log("Navigating to pricing page to activate trial …", "💳", prefix=prefix)
+    _run_browser("open", MOCLAW_PRICING_URL, session_name=session_name, headed=headed)
+    time.sleep(3)  # allow page to fully render
+
+    snap = _run_browser("snapshot", "-i", session_name=session_name, headed=headed)
+
+    # Find the first "Start free trial" button ref
+    trial_ref = None
+    for line in snap.splitlines():
+        ll = line.lower()
+        if "start free trial" in ll or ("start" in ll and "trial" in ll):
+            m = re.search(r"\[ref=(e\d+)\]", line)
+            if m:
+                trial_ref = m.group(1)
+                break
+
+    if not trial_ref:
+        log("'Start free trial' button not found on pricing page — may already be subscribed.", "⚠️", prefix=prefix)
+        return False
+
+    log(f"Clicking 'Start free trial' (ref={trial_ref}) …", "🖱️", prefix=prefix)
+    _run_browser("click", f"@{trial_ref}", session_name=session_name, headed=headed)
+
+    # Wait for redirect / confirmation (checkout page or dashboard)
+    final_url = ""
+    for _ in range(20):
+        time.sleep(1)
+        final_url = _run_browser("url", session_name=session_name, headed=headed)
+        if any(kw in final_url for kw in ("/checkout", "/subscribe", "/billing", "/chat", "/dashboard", "stripe", "paddle")):
+            break
+
+    log(f"Trial activation landed on: {final_url}", "🎯", prefix=prefix)
+    return True
+
+
+# ─── Step 5: View Inbox ───────────────────────────────────────────────────────
 
 def print_inbox(token: str, session: requests.Session) -> None:
     auth_header = {"Authorization": f"Bearer {token}"}
@@ -281,10 +327,11 @@ def run_single(args: argparse.Namespace) -> None:
 
     result = register_one(session_name="moclaw-single", headed=args.headed, prefix="")
 
-    email = result["email"]
-    pw    = result["mailgw_password"]
-    url   = result["moclaw_url"]
-    title = result["page_title"]
+    email  = result["email"]
+    pw     = result["mailgw_password"]
+    url    = result["moclaw_url"]
+    title  = result["page_title"]
+    trial  = "✅ Yes" if result.get("trial_activated") else "⚠️  No"
 
     print()
     print("╔══════════════════════════════════════════════════╗")
@@ -294,6 +341,7 @@ def run_single(args: argparse.Namespace) -> None:
     print(f"║  Password: {pw:<38} ║")
     print(f"║  URL     : {url[:38]:<38} ║")
     print(f"║  Title   : {title[:38]:<38} ║")
+    print(f"║  Trial   : {trial:<38} ║")
     print("╚══════════════════════════════════════════════════╝")
     print()
 
@@ -406,17 +454,19 @@ def run_bulk(args: argparse.Namespace) -> None:
     # Summary table
     success = [r for r in results if r.get("success")]
     failed  = [r for r in results if not r.get("success")]
+    trials  = [r for r in results if r.get("trial_activated")]
 
-    print("─" * 62)
-    print(f"  {'#':<4}  {'Email':<40}  {'Status'}")
-    print("─" * 62)
+    print("─" * 74)
+    print(f"  {'#':<4}  {'Email':<40}  {'Registered':<12}  {'Trial'}")
+    print("─" * 74)
     for r in sorted(results, key=lambda x: x.get("index", 0)):
-        idx   = r.get("index", "?")
-        email = r.get("email", "—")
-        ok    = "✅ OK" if r.get("success") else f"❌ {r.get('error', 'failed')[:20]}"
-        print(f"  {idx:<4}  {email:<40}  {ok}")
-    print("─" * 62)
-    print(f"  Total: {len(results)}  |  Success: {len(success)}  |  Failed: {len(failed)}")
+        idx    = r.get("index", "?")
+        email  = r.get("email", "—")
+        ok     = "✅ OK" if r.get("success") else f"❌ {r.get('error', 'failed')[:15]}"
+        trial  = "✅ Yes" if r.get("trial_activated") else "⚠️  No"
+        print(f"  {idx:<4}  {email:<40}  {ok:<12}  {trial}")
+    print("─" * 74)
+    print(f"  Total: {len(results)}  |  Registered: {len(success)}  |  Trial activated: {len(trials)}  |  Failed: {len(failed)}")
     print(f"  Saved to: {out_file}")
     print()
 
